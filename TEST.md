@@ -1,1 +1,1 @@
-mbethan132@gmail.com Bargersville, IN
+mbethan132@gmail.com Pendleton, IN
