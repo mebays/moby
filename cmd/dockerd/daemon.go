@@ -11,7 +11,6 @@ import (
 	"time"
 
 	containerddefaults "github.com/containerd/containerd/defaults"
-	"github.com/docker/distribution/uuid"
 	"github.com/docker/docker/api"
 	apiserver "github.com/docker/docker/api/server"
 	buildbackend "github.com/docker/docker/api/server/backend/build"
@@ -31,7 +30,6 @@ import (
 	"github.com/docker/docker/api/server/router/volume"
 	buildkit "github.com/docker/docker/builder/builder-next"
 	"github.com/docker/docker/builder/dockerfile"
-	"github.com/docker/docker/builder/fscache"
 	"github.com/docker/docker/cli/debug"
 	"github.com/docker/docker/daemon"
 	"github.com/docker/docker/daemon/cluster"
@@ -46,6 +44,7 @@ import (
 	"github.com/docker/docker/pkg/pidfile"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/signal"
+	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/plugin"
 	"github.com/docker/docker/rootless"
@@ -78,14 +77,12 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	stopc := make(chan bool)
 	defer close(stopc)
 
-	// warn from uuid package when running the daemon
-	uuid.Loggerf = logrus.Warnf
-
 	opts.SetDefaultOptions(opts.flags)
 
 	if cli.Config, err = loadDaemonCliConfig(opts); err != nil {
 		return err
 	}
+	warnOnDeprecatedConfigOptions(cli.Config)
 
 	if err := configureDaemonLogs(cli.Config); err != nil {
 		return err
@@ -102,20 +99,18 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	if cli.Config.Experimental {
 		logrus.Warn("Running experimental build")
-		if cli.Config.IsRootless() {
-			logrus.Warn("Running in rootless mode. Cgroups, AppArmor, and CRIU are disabled.")
-		}
-		if rootless.RunningWithRootlessKit() {
-			logrus.Info("Running with RootlessKit integration")
-			if !cli.Config.IsRootless() {
-				return fmt.Errorf("rootless mode needs to be enabled for running with RootlessKit")
-			}
-		}
-	} else {
-		if cli.Config.IsRootless() {
-			return fmt.Errorf("rootless mode is supported only when running in experimental mode")
+	}
+
+	if cli.Config.IsRootless() {
+		logrus.Warn("Running in rootless mode. This mode has feature limitations.")
+	}
+	if rootless.RunningWithRootlessKit() {
+		logrus.Info("Running with RootlessKit integration")
+		if !cli.Config.IsRootless() {
+			return fmt.Errorf("rootless mode needs to be enabled for running with RootlessKit")
 		}
 	}
+
 	// return human-friendly error before creating files
 	if runtime.GOOS == "linux" && os.Geteuid() != 0 {
 		return fmt.Errorf("dockerd needs to be started with root. To see how to run dockerd in rootless mode with unprivileged user, see the documentation")
@@ -208,14 +203,10 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		return errors.Wrap(err, "failed to validate authorization plugin")
 	}
 
-	// TODO: move into startMetricsServer()
-	if cli.Config.MetricsAddress != "" {
-		if !d.HasExperimental() {
-			return errors.Wrap(err, "metrics-addr is only supported when experimental is enabled")
-		}
-		if err := startMetricsServer(cli.Config.MetricsAddress); err != nil {
-			return err
-		}
+	cli.d = d
+
+	if err := startMetricsServer(cli.Config.MetricsAddress); err != nil {
+		return errors.Wrap(err, "failed to start metrics server")
 	}
 
 	c, err := createAndStartCluster(cli, d)
@@ -229,8 +220,6 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	d.RestartSwarmContainers()
 
 	logrus.Info("Daemon has completed initialization")
-
-	cli.d = d
 
 	routerOptions, err := newRouterOptions(cli.Config, d)
 	if err != nil {
@@ -275,7 +264,6 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 type routerOptions struct {
 	sessionManager *session.Manager
 	buildBackend   *buildbackend.Backend
-	buildCache     *fscache.FSCache // legacy
 	features       *map[string]bool
 	buildkit       *buildkit.Builder
 	daemon         *daemon.Daemon
@@ -290,21 +278,7 @@ func newRouterOptions(config *config.Config, d *daemon.Daemon) (routerOptions, e
 		return opts, errors.Wrap(err, "failed to create sessionmanager")
 	}
 
-	builderStateDir := filepath.Join(config.Root, "builder")
-
-	buildCache, err := fscache.NewFSCache(fscache.Opt{
-		Backend: fscache.NewNaiveCacheBackend(builderStateDir),
-		Root:    builderStateDir,
-		GCPolicy: fscache.GCPolicy{ // TODO: expose this in config
-			MaxSize:         1024 * 1024 * 512,  // 512MB
-			MaxKeepDuration: 7 * 24 * time.Hour, // 1 week
-		},
-	})
-	if err != nil {
-		return opts, errors.Wrap(err, "failed to create fscache")
-	}
-
-	manager, err := dockerfile.NewBuildManager(d.BuilderBackend(), sm, buildCache, d.IdentityMapping())
+	manager, err := dockerfile.NewBuildManager(d.BuilderBackend(), d.IdentityMapping())
 	if err != nil {
 		return opts, err
 	}
@@ -315,7 +289,7 @@ func newRouterOptions(config *config.Config, d *daemon.Daemon) (routerOptions, e
 		Dist:                d.DistributionServices(),
 		NetworkController:   d.NetworkController(),
 		DefaultCgroupParent: cgroupParent,
-		ResolverOpt:         d.NewResolveOptionsFunc(),
+		RegistryHosts:       d.RegistryHosts(),
 		BuilderConfig:       config.Builder,
 		Rootless:            d.Rootless(),
 		IdentityMapping:     d.IdentityMapping(),
@@ -325,14 +299,13 @@ func newRouterOptions(config *config.Config, d *daemon.Daemon) (routerOptions, e
 		return opts, err
 	}
 
-	bb, err := buildbackend.NewBackend(d.ImageService(), manager, buildCache, bk)
+	bb, err := buildbackend.NewBackend(d.ImageService(), manager, bk, d.EventsService)
 	if err != nil {
 		return opts, errors.Wrap(err, "failed to create buildmanager")
 	}
 	return routerOptions{
 		sessionManager: sm,
 		buildBackend:   bb,
-		buildCache:     buildCache,
 		buildkit:       bk,
 		features:       d.Features(),
 		daemon:         d,
@@ -348,19 +321,6 @@ func (cli *DaemonCli) reloadConfig() {
 			return
 		}
 		cli.authzMiddleware.SetPlugins(c.AuthorizationPlugins)
-
-		// The namespaces com.docker.*, io.docker.*, org.dockerproject.* have been documented
-		// to be reserved for Docker's internal use, but this was never enforced.  Allowing
-		// configured labels to use these namespaces are deprecated for 18.05.
-		//
-		// The following will check the usage of such labels, and report a warning for deprecation.
-		//
-		// TODO: At the next stable release, the validation should be folded into the other
-		// configuration validation functions and an error will be returned instead, and this
-		// block should be deleted.
-		if err := config.ValidateReservedNamespaceLabels(c.Labels); err != nil {
-			logrus.Warnf("Configured labels using reserved namespaces is deprecated: %s", err)
-		}
 
 		if err := cli.d.Reload(c); err != nil {
 			logrus.Errorf("Error reconfiguring the daemon: %v", err)
@@ -469,18 +429,6 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The namespaces com.docker.*, io.docker.*, org.dockerproject.* have been documented
-	// to be reserved for Docker's internal use, but this was never enforced.  Allowing
-	// configured labels to use these namespaces are deprecated for 18.05.
-	//
-	// The following will check the usage of such labels, and report a warning for deprecation.
-	//
-	// TODO: At the next stable release, the validation should be folded into the other
-	// configuration validation functions and an error will be returned instead, and this
-	// block should be deleted.
-	if err := config.ValidateReservedNamespaceLabels(newLabels); err != nil {
-		logrus.Warnf("Configured labels using reserved namespaces is deprecated: %s", err)
-	}
 	conf.Labels = newLabels
 
 	// Regardless of whether the user sets it to true or false, if they
@@ -492,15 +440,31 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 	return conf, nil
 }
 
+func warnOnDeprecatedConfigOptions(config *config.Config) {
+	if config.ClusterAdvertise != "" {
+		logrus.Warn(`The "cluster-advertise" option is deprecated. To be removed soon.`)
+	}
+	if config.ClusterStore != "" {
+		logrus.Warn(`The "cluster-store" option is deprecated. To be removed soon.`)
+	}
+	if len(config.ClusterOpts) > 0 {
+		logrus.Warn(`The "cluster-store-opt" option is deprecated. To be removed soon.`)
+	}
+}
+
 func initRouter(opts routerOptions) {
-	decoder := runconfig.ContainerDecoder{}
+	decoder := runconfig.ContainerDecoder{
+		GetSysInfo: func() *sysinfo.SysInfo {
+			return opts.daemon.RawSysInfo(true)
+		},
+	}
 
 	routers := []router.Router{
 		// we need to add the checkpoint router before the container router or the DELETE gets masked
 		checkpointrouter.NewRouter(opts.daemon, decoder),
 		container.NewRouter(opts.daemon, decoder),
 		image.NewRouter(opts.daemon.ImageService()),
-		systemrouter.NewRouter(opts.daemon, opts.cluster, opts.buildCache, opts.buildkit, opts.features),
+		systemrouter.NewRouter(opts.daemon, opts.cluster, opts.buildkit, opts.features),
 		volume.NewRouter(opts.daemon.VolumesService()),
 		build.NewRouter(opts.buildBackend, opts.daemon, opts.features),
 		sessionrouter.NewRouter(opts.sessionManager),
